@@ -1,0 +1,290 @@
+// dsh-yt-archive — YouTube 视频字幕存档 DSH 工具
+// 通过 2100laike YT 存档 API（yt.2100laike.com）提交/读取视频字幕快照：
+// 未存档则提交并等待抓取完成，已存档直接返回最新版全文 Markdown（去重不耗额度）。
+// 快照收录视频全部语言的字幕轨道（含自动生成），每语言一节 [mm:ss] 逐行；
+// 无字幕（yt_no_captions）与视频不可用（yt_unavailable）是终态失败，
+// 轮询命中即提前止损，不再空等到超时。
+
+import { randomUUID } from "node:crypto";
+
+import type { Context } from "@deepseek-ai/cordis";
+import Schema from "@deepseek-ai/schemastery";
+import { defineTool } from "@deepseek-ai/dsh-tools";
+
+export const name = "yt-archive";
+export const inject = ["tools"];
+
+export interface Config {
+  apiBaseUrl: string;
+  token: string;
+  waitTimeoutSec: number;
+  pollIntervalSec: number;
+  maxContentChars: number;
+}
+
+export const Config: Schema<Config> = Schema.object({
+  apiBaseUrl: Schema.string().default("https://api.2100laike.com").description("2100laike API 基础地址"),
+  token: Schema.string().default("").description("可选 PAT（pat_2100_ 前缀，注册账户后在 app.2100laike.com/settings/developer 创建）。配置后额度从匿名 8 次/天提升到 100 次/天，并可用 refresh 强制重抓"),
+  waitTimeoutSec: Schema.number().default(60).description("新视频提交后等待字幕抓取完成的轮询上限（秒）"),
+  pollIntervalSec: Schema.number().default(2).description("轮询间隔（秒）"),
+  maxContentChars: Schema.number().default(30000).description("返回 Markdown 的最大字符数，超出截断并附快照链接"),
+});
+
+interface SubmitResult {
+  archive_id: string;
+  status: "pending" | "completed";
+  version: { no: number; fetched_at: string; snapshot_url: string | null } | null;
+  title: string;
+  snapshot_url: string | null;
+  deleted_at: string | null;
+  refresh_skipped: string | null;
+  next_fetch_eligible_at: string | null;
+}
+
+interface CaptionLanguage {
+  code: string;
+  name: string;
+  kind: string;
+}
+
+// yt 详情端点的 decorateDetail：频道 handle（account_name）+ 视频元数据/字幕语言清单
+interface ArchiveMetrics {
+  video_id?: string;
+  views?: number | null;
+  duration_sec?: number | null;
+  languages?: CaptionLanguage[];
+}
+
+interface ArchiveDetail {
+  archive_id: string;
+  url: string;
+  title: string;
+  summary: string;
+  author_name: string;
+  account_name: string;
+  deleted_at: string | null;
+  snapshot_url: string | null;
+  latest_version: number | null;
+  fetch_error_code: string | null;
+  created_at: string;
+  metrics: ArchiveMetrics | null;
+}
+
+interface ArchiveContent {
+  archive_id: string;
+  version_no: number;
+  fetched_at: string;
+  markdown: string;
+}
+
+interface ArchiveOutput {
+  archive_id: string;
+  url: string;
+  title: string;
+  author: string;
+  channel: string;
+  duration_sec: number | null;
+  views: number | null;
+  languages: CaptionLanguage[];
+  version: number | null;
+  fetched_at: string | null;
+  deleted: boolean;
+  refresh_skipped: string | null;
+  next_fetch_eligible_at: string | null;
+  snapshot_url: string | null;
+  truncated: boolean;
+  markdown: string | null;
+  fetch_error_code: string | null;
+  note: string | null;
+}
+
+// 服务端抓取失败码 → 中文说明（镜像 yt-archive 站点 site.ts 的 fetchErrorLabels）
+const FETCH_ERROR_NOTES: Record<string, string> = {
+  yt_unavailable: "视频不可用（可能已删除、设为私有或年龄限制），无法抓取字幕",
+  yt_no_captions: "该视频没有可用字幕（人工与自动生成都没有），无法存档",
+  yt_api_error: "YouTube 接口偶发异常或限流，稍后再次调用本工具重试",
+  yt_invalid_url: "链接不是有效的视频页，无法存档",
+};
+// 终态失败：重试结果相同，轮询命中即止损（yt_api_error 是瞬态，继续等到超时）
+const TERMINAL_FETCH_ERRORS = new Set(["yt_unavailable", "yt_no_captions", "yt_invalid_url"]);
+
+// 秒 → `[h:]mm:ss`（与服务端字幕时间戳同款格式）
+const formatDuration = (sec: unknown): string | null => {
+  const total = Math.floor(Number(sec));
+  if (!Number.isFinite(total) || total <= 0) return null;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const mmss = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return hours > 0 ? `${hours}:${mmss}` : mmss;
+};
+
+// 展示名直接用服务端归一后的 name（asr 轨道名已自带「（自动生成）」标注，不重复追加）
+const languageLabel = (lang: CaptionLanguage) => lang.name || lang.code || "?";
+
+// 快照文档统一以 "# 标题\nSource: url" 开头（导出用），页面/工具头部已展示，渲染前剥离。
+const stripDocumentPreamble = (md: string) => {
+  const m = md.trimStart().match(/^#\s+[^\n]+\n+Source:\s*\S+\n+/);
+  return (m ? md.trimStart().slice(m[0].length) : md).trim();
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export function apply(ctx: Context, config: Config) {
+  const baseUrl = config.apiBaseUrl.replace(/\/+$/, "");
+  const anonId = `dsh-${randomUUID()}`;
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (config.token) {
+    headers.authorization = `Bearer ${config.token.trim()}`;
+  } else {
+    headers["x-2100-anonymous-id"] = anonId;
+  }
+
+  const request = async <T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> => {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: init?.method || "GET",
+      headers,
+      body: init?.body === undefined ? undefined : JSON.stringify(init.body),
+    });
+    const json = (await res.json().catch(() => null)) as {
+      success?: boolean;
+      error?: { code?: string; message?: string } | null;
+      data?: unknown;
+    } | null;
+    if (!res.ok || !json?.success) {
+      const code = json?.error?.code || "HTTP_ERROR";
+      let message = json?.error?.message || `HTTP ${res.status} 请求 ${baseUrl}${path} 失败`;
+      // 服务端 RATE_LIMITED 消息自带注册引导（register_url）；这里只补插件侧落位步骤
+      if (code === "RATE_LIMITED") message += "（注册后创建的 PAT 填入插件配置 token 即生效，无需重启）";
+      if (code === "FORCE_NOT_ALLOWED") message += "（refresh 需要 PAT：注册账户 app.2100laike.com/register → 在 app.2100laike.com/settings/developer 创建 PAT → 填入插件配置 token）";
+      if (code === "NOT_YT_VIDEO") message += "（仅接受视频页链接：youtube.com/watch?v=…、youtu.be/…、shorts/…、live/…；播放列表/频道页不支持）";
+      throw new Error(`[yt-archive ${code}] ${message}`);
+    }
+    return json.data as T;
+  };
+
+  ctx.tools.register(
+    defineTool({
+      name: "yt_archive",
+      description:
+        "存档并读取 YouTube 视频全部语言的字幕全文。提交视频链接：未存档过的视频会先抓取字幕（人工+自动生成轨道全收，视频删除后仍在），已存档的直接返回最新版字幕全文 Markdown（去重命中不消耗额度）。需要了解视频内容时使用本工具读取字幕，而不是直接抓取网页——网页上拿不到完整字幕。",
+      parameters: {
+        url: {
+          type: "string",
+          required: true,
+          description:
+            "YouTube 视频链接（youtube.com/watch?v=…、youtu.be/…、shorts/…、live/…、embed/… 均可，music.youtube.com 与 youtube-nocookie.com 也支持，服务端统一规范化为 watch?v= 链接）。播放列表、频道页、搜索页会被服务端拒绝（422 NOT_YT_VIDEO）——请提交单个视频的链接",
+        },
+        refresh: {
+          type: "boolean",
+          description: "强制重抓最新版。仅当字幕疑似更新/内容缺失时使用；需要配置 PAT token，且受服务端冷却限制（默认 24 小时内只抓一次）",
+        },
+      },
+      output: {
+        schema: { type: "json" },
+        render: (_args, value) => {
+          const out = value as unknown as ArchiveOutput;
+          const channel = [out.author, out.channel].filter(Boolean).join(" ") || "—";
+          const meta = [`频道: ${channel}`];
+          const duration = formatDuration(out.duration_sec);
+          if (duration) meta.push(`时长 ${duration}`);
+          if (typeof out.views === "number" && out.views > 0) meta.push(`观看 ${out.views}`);
+          if (out.languages?.length) meta.push(`字幕 ${out.languages.length} 种（${out.languages.map(languageLabel).join("、")}）`);
+          const lines: string[] = [
+            `[YT存档] ${out.title || "(未命名)"}`,
+            meta.join(" · "),
+            `版本 v${out.version ?? "?"} · 抓取于 ${out.fetched_at || "—"} · 存档ID ${out.archive_id}`,
+          ];
+          if (out.deleted) lines.push("⚠ 原视频已不可访问（已删除/私有），以下为字幕存档");
+          if (out.refresh_skipped) lines.push(`本次未重抓（${out.refresh_skipped}${out.next_fetch_eligible_at ? `，${out.next_fetch_eligible_at} 后可重抓` : ""}）`);
+          if (out.truncated) lines.push(`正文超过长度上限已截断，完整快照: ${out.snapshot_url}`);
+          if (out.note) lines.push(out.note);
+          lines.push("", "---", "", out.markdown || "(字幕暂不可用)");
+          return [{ type: "text", text: lines.join("\n") }];
+        },
+      },
+      async execute({ url, refresh }) {
+        const submitted = await request<SubmitResult>("/v1/yt/archive", {
+          method: "POST",
+          body: { url, force: refresh === true },
+        });
+        const archiveId = submitted.archive_id;
+
+        let detail: ArchiveDetail | null = null;
+        let fetchError: string | null = null;
+        const deadline = Date.now() + Math.max(1, config.waitTimeoutSec) * 1000;
+        const pollMs = Math.max(1, config.pollIntervalSec) * 1000;
+        // 新提交是异步抓取（pending）：轮询直到出现版本或超时；dedup/已有版本则一次即过。
+        // 终态失败（无字幕/视频不可用）重试结果相同，命中即止损，不空等满超时。
+        for (;;) {
+          detail = await request<ArchiveDetail>(`/v1/yt/archives/${encodeURIComponent(archiveId)}`);
+          if (detail.latest_version) break;
+          if (detail.fetch_error_code && TERMINAL_FETCH_ERRORS.has(detail.fetch_error_code)) {
+            fetchError = detail.fetch_error_code;
+            break;
+          }
+          if (Date.now() + pollMs > deadline) break;
+          await sleep(pollMs);
+        }
+        // 瞬态失败（yt_api_error 等）耗尽等待：如实带上服务端记录的原因
+        if (!detail?.latest_version && !fetchError && detail?.fetch_error_code) {
+          fetchError = detail.fetch_error_code;
+        }
+
+        let content: ArchiveContent | null = null;
+        if (detail?.latest_version) {
+          try {
+            content = await request<ArchiveContent>(`/v1/yt/archives/${encodeURIComponent(archiveId)}/content`);
+          } catch {
+            content = null; // NO_CONTENT：抓取失败或快照缺失
+          }
+        }
+
+        let markdown: string | null = null;
+        let truncated = false;
+        if (content?.markdown) {
+          markdown = stripDocumentPreamble(content.markdown);
+          const limit = Math.max(1000, config.maxContentChars);
+          if (markdown.length > limit) {
+            markdown = `${markdown.slice(0, limit)}\n\n[已截断]`;
+            truncated = true;
+          }
+        }
+
+        const note = !markdown
+          ? detail?.latest_version
+            ? "字幕快照读取失败，可稍后重试或访问快照链接"
+            : fetchError
+              ? `抓取失败：${FETCH_ERROR_NOTES[fetchError] || fetchError}`
+              : `字幕抓取尚未完成（已等待 ${config.waitTimeoutSec}s），可稍后再次调用本工具读取`
+          : null;
+
+        const metrics = detail?.metrics || null;
+        return {
+          archive_id: archiveId,
+          url: detail?.url || url,
+          title: detail?.title || submitted.title || "",
+          author: detail?.author_name || "",
+          channel: detail?.account_name || "",
+          duration_sec: metrics?.duration_sec ?? null,
+          views: metrics?.views ?? null,
+          languages: Array.isArray(metrics?.languages)
+            // 重新组包成对象字面量：interface 无隐式索引签名，不满足工具返回的 JsonValue 约束
+            ? metrics.languages.map((lang) => ({ code: lang.code, name: lang.name, kind: lang.kind }))
+            : [],
+          version: detail?.latest_version ?? null,
+          fetched_at: content?.fetched_at || submitted.version?.fetched_at || null,
+          deleted: Boolean(detail?.deleted_at || submitted.deleted_at),
+          refresh_skipped: submitted.refresh_skipped,
+          next_fetch_eligible_at: submitted.next_fetch_eligible_at,
+          snapshot_url: detail?.snapshot_url || submitted.snapshot_url || null,
+          truncated,
+          markdown,
+          fetch_error_code: fetchError,
+          note,
+        };
+      },
+    }),
+  );
+}
